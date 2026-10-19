@@ -1,0 +1,30 @@
+{
+  "rows_after_cleaning": 10000,
+  "columns": [
+    "N",
+    "P",
+    "K",
+    "Soil_pH",
+    "Soil_Moisture",
+    "Soil_Type",
+    "Organic_Carbon",
+    "Temperature",
+    "Humidity",
+    "Rainfall",
+    "Sunlight_Hours",
+    "Wind_Speed",
+    "Region",
+    "Altitude",
+    "Season",
+    "Crop_Type",
+    "Irrigation_Type",
+    "Fertilizer_Used",
+    "Pesticide_Used",
+    "Crop_Yield_ton_per_hectare"
+  ],
+  "season_crop_chi_square": {
+    "chi2": 10.35867914872069,
+    "p_value": 0.4096084983040637,
+    "degrees_of_freedom": 10
+  }
+}
