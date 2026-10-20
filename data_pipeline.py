@@ -1,185 +1,319 @@
-"""AgriMarket-Intelligence data pipeline for the dataset included in this ZIP.
-
-The included CSV contains soil, weather, crop, irrigation and yield columns.
-It does NOT contain Agmarknet market prices, Area, or Production. This script
-therefore analyzes the supplied data and predicts Crop_Yield_ton_per_hectare.
-
-Run from the repository root:
-    python data_pipeline.py
 """
-from __future__ import annotations
+AgriMarket Intelligence — Data Pipeline
+========================================
+Dataset: Crop Yield Prediction (Soil + Climate + Farm Inputs)
+Columns: N, P, K, Soil_pH, Soil_Moisture, Soil_Type, Organic_Carbon,
+         Temperature, Humidity, Rainfall, Sunlight_Hours, Wind_Speed,
+         Region, Altitude, Season, Crop_Type, Irrigation_Type,
+         Fertilizer_Used, Pesticide_Used, Crop_Yield_ton_per_hectare
+"""
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import chi2_contingency
-from sklearn.compose import ColumnTransformer
+from scipy.stats import chi2_contingency, pearsonr
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-import joblib
+from sklearn.preprocessing import LabelEncoder
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_INPUT = ROOT / "data" / "raw_agmarknet.csv"
-DEFAULT_OUTPUT = ROOT / "data" / "cleaned_agriculture_data.csv"
-MODEL_DIR = ROOT / "models"
-REPORT_DIR = ROOT / "reports"
-TARGET = "Crop_Yield_ton_per_hectare"
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Column definitions
+# ---------------------------------------------------------------------------
+NUMERIC_COLS = [
+    "N", "P", "K", "Soil_pH", "Soil_Moisture", "Organic_Carbon",
+    "Temperature", "Humidity", "Rainfall", "Sunlight_Hours",
+    "Wind_Speed", "Altitude", "Fertilizer_Used", "Pesticide_Used",
+    "Crop_Yield_ton_per_hectare",
+]
+CATEGORICAL_COLS = ["Soil_Type", "Region", "Season", "Crop_Type", "Irrigation_Type"]
+TARGET_COL = "Crop_Yield_ton_per_hectare"
 
 
-def load_data(path: Path = DEFAULT_INPUT) -> pd.DataFrame:
-    """Load the source CSV and normalize column labels."""
+# ---------------------------------------------------------------------------
+# 1. Load
+# ---------------------------------------------------------------------------
+def load_raw_data(csv_path: str = "data/raw_agmarknet.csv") -> pd.DataFrame:
+    """Load the raw crop-yield dataset and normalise column names."""
+    path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(
-            f"Dataset not found: {path}\nPlace raw_agmarknet.csv in the project's data/ folder."
+            f"Raw dataset not found at '{path}'. "
+            "Please place raw_agmarknet.csv in the data/ folder."
         )
     df = pd.read_csv(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    if df.empty:
-        raise ValueError("The input CSV has no rows.")
-    if TARGET not in df.columns:
-        raise ValueError(
-            f"Required target column '{TARGET}' is missing. Found columns: {list(df.columns)}"
-        )
+    df.columns = [str(col).strip() for col in df.columns]
+    print(f"[load] Raw shape: {df.shape}")
     return df
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove duplicates, trim text, convert numeric fields and handle missing values."""
-    data = df.copy().drop_duplicates().reset_index(drop=True)
-    for col in data.select_dtypes(include=["object", "string"]).columns:
-        data[col] = data[col].astype("string").str.strip()
-        data[col] = data[col].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+# ---------------------------------------------------------------------------
+# 2. Clean
+# ---------------------------------------------------------------------------
+def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the raw dataset: duplicates, types, missing values, outliers."""
+    cleaned = df.copy()
 
-    # Convert columns that are already numeric or mostly numeric, excluding text categories.
-    categorical = {"Soil_Type", "Region", "Season", "Crop_Type", "Irrigation_Type"}
-    for col in data.columns:
-        if col not in categorical:
-            converted = pd.to_numeric(data[col], errors="coerce")
-            if converted.notna().sum() > 0:
-                data[col] = converted
+    # --- Remove duplicates ---
+    before = len(cleaned)
+    cleaned = cleaned.drop_duplicates().reset_index(drop=True)
+    print(f"[clean] Removed {before - len(cleaned)} duplicate rows.")
 
-    # A row without a target cannot train/evaluate a supervised model.
-    data[TARGET] = pd.to_numeric(data[TARGET], errors="coerce")
-    data = data.dropna(subset=[TARGET]).reset_index(drop=True)
-    if data.empty:
-        raise ValueError(f"No valid rows remain after checking target column '{TARGET}'.")
+    # --- Strip whitespace from categoricals ---
+    for col in CATEGORICAL_COLS:
+        if col in cleaned.columns:
+            cleaned[col] = cleaned[col].astype(str).str.strip().str.title()
 
-    # Replace infinite numeric values; missing feature values are imputed inside the ML pipeline.
-    numeric_cols = data.select_dtypes(include=[np.number]).columns
-    data[numeric_cols] = data[numeric_cols].replace([np.inf, -np.inf], np.nan)
-    return data
+    # --- Coerce numeric columns ---
+    for col in NUMERIC_COLS:
+        if col in cleaned.columns:
+            cleaned[col] = pd.to_numeric(cleaned[col], errors="coerce")
+
+    # --- Replace infinities ---
+    cleaned.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # --- Missing value report ---
+    missing = cleaned.isnull().sum()
+    missing = missing[missing > 0]
+    if not missing.empty:
+        print("[clean] Missing values detected:")
+        print(missing)
+    else:
+        print("[clean] No missing values found.")
+
+    # --- Impute numeric with median grouped by Crop_Type ---
+    for col in NUMERIC_COLS:
+        if col not in cleaned.columns or col == TARGET_COL:
+            continue
+        if cleaned[col].isnull().any():
+            if "Crop_Type" in cleaned.columns:
+                group_median = cleaned.groupby("Crop_Type")[col].transform("median")
+                cleaned[col] = cleaned[col].fillna(group_median)
+            cleaned[col] = cleaned[col].fillna(cleaned[col].median())
+
+    # --- Impute categoricals with mode ---
+    for col in CATEGORICAL_COLS:
+        if col in cleaned.columns and cleaned[col].isnull().any():
+            cleaned[col] = cleaned[col].fillna(cleaned[col].mode()[0])
+
+    print(f"[clean] Cleaned shape: {cleaned.shape}")
+    return cleaned
 
 
-def run_analysis(df: pd.DataFrame) -> dict:
-    """Print summary analysis and run a chi-square test when categories permit."""
-    print("\n=== DATA OVERVIEW ===")
-    print(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
-    print("\nMissing values by column:\n", df.isna().sum().to_string())
-    numeric = df.select_dtypes(include=[np.number])
-    if not numeric.empty:
-        print("\n=== NUMERIC SUMMARY ===\n", numeric.describe().round(3).to_string())
-        corr = numeric.corr(numeric_only=True)
-        corr_path = REPORT_DIR / "correlation_matrix.csv"
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        corr.to_csv(corr_path)
-        print(f"\nCorrelation matrix saved to: {corr_path.relative_to(ROOT)}")
+# ---------------------------------------------------------------------------
+# 3. Feature Engineering
+# ---------------------------------------------------------------------------
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive useful composite features."""
+    df = df.copy()
 
-    result = {"rows_after_cleaning": int(len(df)), "columns": list(df.columns)}
-    if "Season" in df.columns and "Crop_Type" in df.columns:
-        table = pd.crosstab(df["Season"].fillna("Unknown"), df["Crop_Type"].fillna("Unknown"))
-        if table.shape[0] > 1 and table.shape[1] > 1:
-            chi2, p_value, dof, _ = chi2_contingency(table)
-            result["season_crop_chi_square"] = {
-                "chi2": float(chi2), "p_value": float(p_value), "degrees_of_freedom": int(dof)
-            }
-            print("\n=== CHI-SQUARE: SEASON VS CROP TYPE ===")
-            print(f"chi-square={chi2:.3f}, p-value={p_value:.6g}, dof={dof}")
+    # Nutrient balance index
+    df["NPK_Total"] = df["N"] + df["P"] + df["K"]
+    df["NP_Ratio"] = df["N"] / (df["P"] + 1)  # +1 to avoid div-by-zero
+
+    # Climate composite
+    df["Heat_Moisture_Index"] = df["Temperature"] * df["Humidity"] / 100
+    df["Rainfall_per_SunHour"] = df["Rainfall"] / (df["Sunlight_Hours"] + 0.1)
+
+    # Encode categoricals as integer labels (for correlation / modelling)
+    le = LabelEncoder()
+    for col in CATEGORICAL_COLS:
+        if col in df.columns:
+            df[f"{col}_Code"] = le.fit_transform(df[col].astype(str))
+
+    print(f"[feature] Feature-engineered shape: {df.shape}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. Statistical Analysis
+# ---------------------------------------------------------------------------
+def pearson_correlation_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute Pearson correlation matrix for key numeric features."""
+    corr_cols = [c for c in NUMERIC_COLS if c in df.columns]
+    corr_df = df[corr_cols].corr(method="pearson")
+    print("\n[stats] Pearson Correlation Matrix (key columns):")
+    print(corr_df[[TARGET_COL]].sort_values(TARGET_COL, ascending=False))
+    return corr_df
+
+
+def chi_square_test(df: pd.DataFrame, col_a: str = "Season", col_b: str = "Crop_Type") -> dict:
+    """Chi-square test of independence between two categorical columns."""
+    contingency = pd.crosstab(df[col_a].astype(str), df[col_b].astype(str))
+    chi2, p_value, dof, expected = chi2_contingency(contingency)
+    result = {
+        "chi2": round(float(chi2), 4),
+        "p_value": round(float(p_value), 6),
+        "degrees_of_freedom": dof,
+        "interpretation": (
+            "REJECT H₀ — Season and Crop_Type are NOT independent (significant association)"
+            if p_value < 0.05
+            else "FAIL TO REJECT H₀ — Season and Crop_Type appear independent"
+        ),
+    }
+    print(f"\n[stats] Chi-Square Test ({col_a} vs {col_b}):")
+    for k, v in result.items():
+        if k not in ("contingency_table", "expected_table"):
+            print(f"  {k}: {v}")
     return result
 
 
-def train_model(df: pd.DataFrame) -> tuple[Pipeline, dict, pd.DataFrame]:
-    """Train a Random Forest regression pipeline and return metrics/importances."""
-    X = df.drop(columns=[TARGET])
-    y = df[TARGET]
-    categorical_cols = X.select_dtypes(include=["object", "string", "category"]).columns.tolist()
-    numeric_cols = [c for c in X.columns if c not in categorical_cols]
+# ---------------------------------------------------------------------------
+# 5. Machine Learning — Random Forest
+# ---------------------------------------------------------------------------
+def prepare_model_data(df: pd.DataFrame) -> tuple:
+    """Return (X, y) ready for sklearn, using one-hot encoded categoricals."""
+    model_df = df.copy()
 
-    numeric_pipe = Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))])
-    categorical_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-    ])
-    prep = ColumnTransformer(transformers=[
-        ("numeric", numeric_pipe, numeric_cols),
-        ("categorical", categorical_pipe, categorical_cols),
-    ])
-    model = Pipeline(steps=[
-        ("preprocessor", prep),
-        ("regressor", RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)),
-    ])
+    # Use the label-coded columns already added by engineer_features
+    feature_candidates = (
+        [c for c in NUMERIC_COLS if c in model_df.columns and c != TARGET_COL]
+        + [f"{c}_Code" for c in CATEGORICAL_COLS if f"{c}_Code" in model_df.columns]
+        + ["NPK_Total", "NP_Ratio", "Heat_Moisture_Index", "Rainfall_per_SunHour"]
+    )
+    feature_candidates = [c for c in feature_candidates if c in model_df.columns]
+
+    X = model_df[feature_candidates].fillna(model_df[feature_candidates].median())
+    y = model_df[TARGET_COL].fillna(model_df[TARGET_COL].median())
+    return X, y
+
+
+def train_random_forest_model(df: pd.DataFrame) -> tuple:
+    """Train a Random Forest Regressor and return metrics + feature importances."""
+    X, y = prepare_model_data(df)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
-    model.fit(X_train, y_train)
-    pred = model.predict(X_test)
+
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+    rf.fit(X_train, y_train)
+
+    y_pred = rf.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    feature_importance = (
+        pd.Series(rf.feature_importances_, index=X.columns)
+        .sort_values(ascending=False)
+    )
+
     metrics = {
-        "target": TARGET,
-        "rows_used": int(len(df)),
-        "test_rows": int(len(y_test)),
-        "MAE": float(mean_absolute_error(y_test, pred)),
-        "RMSE": float(np.sqrt(mean_squared_error(y_test, pred))),
-        "R2": float(r2_score(y_test, pred)),
+        "target": TARGET_COL,
+        "rows_used": len(X),
+        "test_rows": len(X_test),
+        "MAE": round(float(mae), 6),
+        "RMSE": round(float(rmse), 6),
+        "R2": round(float(r2), 6),
         "random_state": 42,
     }
 
-    # Get feature importances using transformed feature names when supported.
-    try:
-        names = model.named_steps["preprocessor"].get_feature_names_out()
-        values = model.named_steps["regressor"].feature_importances_
-        importance = pd.DataFrame({"feature": names, "importance": values}).sort_values(
-            "importance", ascending=False
-        )
-    except (AttributeError, ValueError):
-        importance = pd.DataFrame(columns=["feature", "importance"])
+    print("\n[model] Random Forest — Yield Prediction")
+    print(f"  MAE : {mae:.4f}")
+    print(f"  RMSE: {rmse:.4f}")
+    print(f"  R²  : {r2:.4f}")
+    print("\n  Top 10 Feature Importances:")
+    print(feature_importance.head(10).to_string())
 
-    print("\n=== RANDOM FOREST YIELD PREDICTION ===")
-    for key, value in metrics.items():
-        print(f"{key}: {value}")
-    if not importance.empty:
-        print("\nTop 10 feature importances:\n", importance.head(10).to_string(index=False))
-    return model, metrics, importance
+    return metrics, feature_importance, rf
 
 
-def run_pipeline(input_path: Path = DEFAULT_INPUT, output_path: Path = DEFAULT_OUTPUT) -> pd.DataFrame:
-    """Run cleaning, analysis, ML, and export files for Tableau/reporting."""
-    raw = load_data(input_path)
-    cleaned = clean_data(raw)
-    analysis = run_analysis(cleaned)
-    model, metrics, importance = train_model(cleaned)
+# ---------------------------------------------------------------------------
+# 6. Export helpers
+# ---------------------------------------------------------------------------
+def save_outputs(
+    cleaned_df: pd.DataFrame,
+    corr_df: pd.DataFrame,
+    chi_result: dict,
+    metrics: dict,
+    feature_importance: pd.Series,
+    output_csv: str = "data/cleaned_agriculture_data.csv",
+    output_xlsx: str = "data/cleaned_agriculture_data.xlsx",
+):
+    """Save all analysis outputs to disk."""
+    out_csv = Path(output_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    cleaned_df.to_csv(out_csv, index=False)
+    print(f"[export] Cleaned CSV → {out_csv}")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cleaned.to_csv(output_path, index=False)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, MODEL_DIR / "crop_yield_random_forest.joblib")
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    with (REPORT_DIR / "model_metrics.json").open("w", encoding="utf-8") as f:
+    # Excel (for Tableau)
+    out_xlsx = Path(output_xlsx)
+    cleaned_df.to_excel(out_xlsx, index=False)
+    print(f"[export] Excel for Tableau → {out_xlsx}")
+
+    # Correlation matrix
+    corr_path = Path("reports/correlation_matrix.csv")
+    corr_path.parent.mkdir(parents=True, exist_ok=True)
+    corr_df.to_csv(corr_path)
+    print(f"[export] Correlation matrix → {corr_path}")
+
+    # Feature importance
+    fi_path = Path("reports/feature_importance.csv")
+    feature_importance.reset_index().rename(
+        columns={"index": "Feature", 0: "Importance"}
+    ).to_csv(fi_path, index=False)
+    print(f"[export] Feature importance → {fi_path}")
+
+    # Model metrics
+    mm_path = Path("reports/model_metrics.json")
+    with open(mm_path, "w") as f:
         json.dump(metrics, f, indent=2)
-    with (REPORT_DIR / "analysis_summary.json").open("w", encoding="utf-8") as f:
-        json.dump(analysis, f, indent=2)
-    if not importance.empty:
-        importance.to_csv(REPORT_DIR / "feature_importance.csv", index=False)
+    print(f"[export] Model metrics → {mm_path}")
 
-    print(f"\nCleaned data saved to: {output_path.relative_to(ROOT) if output_path.is_relative_to(ROOT) else output_path}")
-    print(f"Model saved to: {MODEL_DIR / 'crop_yield_random_forest.joblib'}")
-    print(f"Metrics saved to: {REPORT_DIR / 'model_metrics.json'}")
-    return cleaned
+    # Analysis summary (for reporting)
+    summary = {
+        "rows_after_cleaning": len(cleaned_df),
+        "columns": list(cleaned_df.columns),
+        "numeric_summary": cleaned_df[NUMERIC_COLS].describe().round(3).to_dict(),
+        "season_crop_chi_square": {
+            k: v for k, v in chi_result.items()
+            if k not in ("contingency_table", "expected_table")
+        },
+        "model_r2": metrics["R2"],
+        "model_rmse": metrics["RMSE"],
+    }
+    sm_path = Path("reports/analysis_summary.json")
+    with open(sm_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[export] Analysis summary → {sm_path}")
+
+
+# ---------------------------------------------------------------------------
+# 7. Full pipeline
+# ---------------------------------------------------------------------------
+def run_pipeline(
+    csv_path: str = "data/raw_agmarknet.csv",
+    output_csv: str = "data/cleaned_agriculture_data.csv",
+    output_xlsx: str = "data/cleaned_agriculture_data.xlsx",
+) -> pd.DataFrame:
+    """Execute the complete data pipeline end-to-end."""
+    print("=" * 60)
+    print(" AgriMarket Intelligence — Full Data Pipeline")
+    print("=" * 60)
+
+    raw_df = load_raw_data(csv_path)
+    cleaned_df = clean_dataset(raw_df)
+    cleaned_df = engineer_features(cleaned_df)
+
+    corr_df = pearson_correlation_analysis(cleaned_df)
+    chi_result = chi_square_test(cleaned_df, "Season", "Crop_Type")
+    metrics, feature_importance, _ = train_random_forest_model(cleaned_df)
+
+    save_outputs(cleaned_df, corr_df, chi_result, metrics, feature_importance,
+                 output_csv, output_xlsx)
+
+    print("\n" + "=" * 60)
+    print(" Pipeline complete!")
+    print(f" Rows: {len(cleaned_df)}  |  Columns: {len(cleaned_df.columns)}")
+    print(" Next: open notebooks/01_dav_analysis.ipynb")
+    print("=" * 60)
+    return cleaned_df
 
 
 if __name__ == "__main__":
